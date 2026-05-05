@@ -2,13 +2,17 @@
 
 Modes:
 
+* ``--run <SPEC.yaml>`` (headless) — load a YAML run spec, drive the
+  agent core to completion, write a JSON report, exit 0/1 based on
+  whether the requested artifacts were produced. Designed for cron
+  jobs, CI, parameter sweeps. See :mod:`psyneulink_agent.runner`.
 * ``--chat`` (interactive) — spawn ``claude`` with the MCP attached and
   the modeling system prompt. The Claude Max fallback for users without
   an Anthropic API key.
 * ``--chat-sdk`` (interactive) — drive the modeling loop directly via
-  the Anthropic Python SDK. The new default, foundation for the web UI
-  and a future ``--run`` headless mode. Accepts ``--pdf``, ``--data``,
-  ``--model`` to pre-attach resources before the first turn.
+  the Anthropic Python SDK. The new default, foundation for the web UI.
+  Accepts ``--pdf``, ``--data``, ``--model`` to pre-attach resources
+  before the first turn.
 * ``--list-tools`` — print every MCP-exposed tool, one per line. Sanity
   check that the server is reachable.
 * ``--call TOOL --arg KEY=VALUE`` — invoke one tool directly, no LLM.
@@ -78,6 +82,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psyneulink-agent",
         description="Modeling agent for psyneulink-ai — connect to and inspect the MCP server.",
+    )
+    parser.add_argument(
+        "--run",
+        metavar="SPEC",
+        default=None,
+        help=(
+            "Run the agent headlessly against a YAML spec describing the "
+            "modeling goal, resources, and desired artifacts. Writes a "
+            "JSON run report and exits 0/1 based on artifact existence."
+        ),
     )
     parser.add_argument(
         "--chat",
@@ -249,6 +263,39 @@ async def _run_chat_sdk(
     return await repl(mcp_project, initial_resources) or 0
 
 
+def _run_headless(spec_path: str, mcp_project: Path | None) -> int:
+    """Load + run a YAML spec; print a one-line summary; return 0/1."""
+    from .runner import SpecError, load_spec, run_spec
+
+    try:
+        spec = load_spec(spec_path)
+    except SpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        report = run_spec(spec, mcp_project=mcp_project)
+    except BaseException as exc:  # noqa: BLE001 — top-level: report cleanly, exit non-zero
+        for sub in _flatten(exc):
+            print(f"run failed: {type(sub).__name__}: {sub}", file=sys.stderr)
+        return 1
+
+    artifacts = report.get("artifacts", {})
+    if artifacts:
+        artifact_summary = ", ".join(
+            f"{k}={v.get('status')}" for k, v in artifacts.items()
+        )
+    else:
+        artifact_summary = "no artifacts requested"
+    print(
+        f"run complete: turns_sent={report.get('turns_sent')} "
+        f"artifacts=[{artifact_summary}] "
+        f"report={spec.report_path}",
+        file=sys.stderr,
+    )
+    return 0 if report.get("ok") else 1
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -259,6 +306,32 @@ def main() -> None:
     mcp_project = Path(ns.mcp_project) if ns.mcp_project else None
 
     resource_flags_used = bool(ns.pdf or ns.data or ns.model)
+
+    # --run is exclusive with the interactive / one-shot-call modes. Resource
+    # pre-attach flags only feed --chat-sdk, so warn (don't error) if combined
+    # with --run; the spec's `resources:` field is the headless equivalent.
+    if ns.run is not None:
+        conflicting = [
+            name for name, val in (
+                ("--chat", ns.chat),
+                ("--chat-sdk", ns.chat_sdk),
+                ("--call", ns.call),
+            )
+            if val
+        ]
+        if conflicting:
+            print(
+                f"error: --run is mutually exclusive with {', '.join(conflicting)}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if resource_flags_used:
+            print(
+                "warning: --pdf/--data/--model are ignored with --run "
+                "(declare resources in the spec's `resources:` block).",
+                file=sys.stderr,
+            )
+        sys.exit(_run_headless(ns.run, mcp_project))
 
     if ns.chat_sdk:
         sys.exit(asyncio.run(_run_chat_sdk(mcp_project, ns.pdf, ns.data, ns.model)))

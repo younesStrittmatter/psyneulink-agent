@@ -1,0 +1,21 @@
+# Smoke test for `psyneulink-agent --run`.
+#
+# Run with:
+#     psyneulink-agent --run examples/run-specs/smoke.yaml
+#
+# Requires $ANTHROPIC_API_KEY and a reachable psyneulink-mcp.
+# Not exercised in CI.
+
+version: 1
+
+goal: |
+  Build a small PsyNeuLink composition: two TransferMechanisms named
+  "input_layer" and "output_layer", connected via a default
+  MappingProjection inside a Composition called "smoke_model".
+  Run it on inputs [[1.0]] and report the output.
+
+artifacts:
+  python_script: ./smoke_model.py
+
+limits:
+  max_turns: 5
