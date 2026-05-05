@@ -39,9 +39,14 @@ expected.
 `create_processing_mechanism`, `create_lca_mechanism`, …).
    b. Create a Composition (`create_composition`).
    c. Wire mechanisms inside it. For a feed-forward chain use \
-`add_linear_pathway(composition=<h>, nodes=[<h_in>, <h_hidden>, \
-<h_out>])`. For arbitrary topologies use `add_node` + `add_projection` \
-(pass `matrix=` for a custom weight matrix; otherwise PNL chooses).
+`add_linear_processing_pathway(composition=<h>, pathway=[<h_in>, \
+<h_hidden>, <h_out>])`. For arbitrary topologies use `add_node` + \
+`add_projection` (pass `matrix=` for a custom weight matrix — \
+either a 2D array or one of PNL's keyword strings like \
+`IDENTITY_MATRIX` / `FULL_CONNECTIVITY_MATRIX`; otherwise PNL chooses). \
+`add_projection` will defensively add the sender and receiver to the \
+composition for you, and treats a duplicate projection as a no-op \
+success — you don't have to babysit ordering or de-dupe.
    d. Run it with `run_composition(composition=<h>, inputs={<h_input>: \
 [[trial1_values], [trial2_values], ...]})`. PNL inputs are nested \
 lists — the outer dimension is trials, the inner dimension is the \

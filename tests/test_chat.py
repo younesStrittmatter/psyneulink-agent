@@ -36,7 +36,10 @@ def test_system_prompt_mentions_handles_and_run_composition() -> None:
         "handle",
         "create_transfer_mechanism",
         "create_composition",
-        "add_linear_pathway",
+        # Renamed from add_linear_pathway when the curated tool migrated
+        # to the generated layer (psyneulink-mcp seed adds the canonical
+        # ``Composition.add_linear_processing_pathway`` method tool).
+        "add_linear_processing_pathway",
         "run_composition",
     ):
         assert needle in text, f"system prompt missing {needle!r}"
