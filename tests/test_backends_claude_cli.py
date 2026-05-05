@@ -219,6 +219,8 @@ def test_run_turn_spawns_claude_with_expected_argv(monkeypatch) -> None:
     assert "--strict-mcp-config" in argv
     tools_idx = argv.index("--tools")
     assert argv[tools_idx + 1] == ""
+    pm_idx = argv.index("--permission-mode")
+    assert argv[pm_idx + 1] == "bypassPermissions"
     assert "--mcp-config" in argv
     assert cfg_data["mcpServers"]["psyneulink"]["url"] == "http://127.0.0.1:1234/sse"
     sp_idx = argv.index("--append-system-prompt")
@@ -550,8 +552,10 @@ def test_run_turn_pipes_full_content_blocks_via_stream_json(monkeypatch) -> None
     assert sent_content[1] == {"type": "text", "text": "summarise this paper"}
 
 
-def test_run_turn_passes_session_id_for_multi_turn(monkeypatch) -> None:
-    """Both invocations on the same backend instance must use the same UUID."""
+def test_run_turn_session_id_then_resume_for_multi_turn(monkeypatch) -> None:
+    """Turn 1 creates the on-disk session with ``--session-id``; turn ≥ 2
+    must re-attach with ``--resume`` (claude refuses ID reuse with
+    ``--session-id``)."""
     capture = _install_fake_subprocess(
         monkeypatch,
         stdout_lines=[_line(_success_result())],
@@ -562,7 +566,7 @@ def test_run_turn_passes_session_id_for_multi_turn(monkeypatch) -> None:
         session_id="11111111-2222-3333-4444-555555555555",
     )
     try:
-        for prompt in ["first", "second"]:
+        for prompt in ["first", "second", "third"]:
             _drive(
                 backend.run_turn(
                     history=[],
@@ -575,15 +579,52 @@ def test_run_turn_passes_session_id_for_multi_turn(monkeypatch) -> None:
     finally:
         backend.cleanup()
 
-    assert len(capture["argv_history"]) == 2
-    sids: list[str] = []
-    for argv in capture["argv_history"]:
-        sid_idx = argv.index("--session-id")
-        sids.append(argv[sid_idx + 1])
-    assert sids == [
-        "11111111-2222-3333-4444-555555555555",
-        "11111111-2222-3333-4444-555555555555",
-    ]
+    assert len(capture["argv_history"]) == 3
+
+    argv_t1 = capture["argv_history"][0]
+    assert "--session-id" in argv_t1
+    assert "--resume" not in argv_t1
+    assert argv_t1[argv_t1.index("--session-id") + 1] == (
+        "11111111-2222-3333-4444-555555555555"
+    )
+
+    for argv in capture["argv_history"][1:]:
+        assert "--resume" in argv
+        assert "--session-id" not in argv
+        assert argv[argv.index("--resume") + 1] == (
+            "11111111-2222-3333-4444-555555555555"
+        )
+
+
+def test_failed_first_turn_keeps_session_id_for_retry(monkeypatch) -> None:
+    """If turn 1 fails (e.g. auth error), the next turn should still use
+    --session-id to *create* the session rather than --resume a session
+    that was never written to disk."""
+    _install_fake_subprocess(
+        monkeypatch,
+        stdout_lines=[],
+        stderr_lines=[b"Invalid API key\n"],
+        returncode=1,
+    )
+    backend = ClaudeCliBackend(
+        mcp_url="http://x/sse",
+        claude_path="/fake/claude",
+        session_id="22222222-3333-4444-5555-666666666666",
+    )
+    try:
+        _drive(
+            backend.run_turn(
+                history=[],
+                system_prompt="s",
+                user_content=[{"type": "text", "text": "x"}],
+                mcp=object(),
+                tools=[],
+            )
+        )
+    finally:
+        backend.cleanup()
+
+    assert backend._session_created is False
 
 
 def test_run_turn_skips_unknown_event_shapes_silently(monkeypatch) -> None:

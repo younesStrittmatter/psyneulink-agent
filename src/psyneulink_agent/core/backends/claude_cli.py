@@ -119,6 +119,13 @@ class ClaudeCliBackend(LLMBackend):
         self.session_id = session_id or str(uuid.uuid4())
         self.extra_args = list(extra_args or [])
         self._mcp_config_path: Path | None = None
+        # Multi-turn coherence: claude CLI rejects ``--session-id <UUID>``
+        # on a UUID it has already seen ("Session ID is already in use").
+        # The contract is: ``--session-id`` *creates* a new on-disk session;
+        # ``--resume <UUID>`` re-attaches to an existing one. We track
+        # whether we've created the session yet and switch flags on turn
+        # ≥ 2.
+        self._session_created = False
 
     def _build_mcp_config(self) -> Path:
         """Write a one-shot ``--mcp-config`` file pointing claude at our SSE MCP."""
@@ -186,11 +193,28 @@ class ClaudeCliBackend(LLMBackend):
             # are unaffected.
             "--tools",
             "",
+            # Skip per-tool permission prompts. Safe in this config
+            # because: (a) builtins are disabled above (no Bash / Edit
+            # / Write to bypass for) and (b) --strict-mcp-config means
+            # the only MCP tools available are from the psyneulink
+            # server we explicitly point at, all of which are
+            # in-process modelling primitives we trust. Without this,
+            # claude returns a "permissions not granted" tool_result
+            # for every MCP call and the agent dead-locks waiting for
+            # an interactive approval that no one is around to give.
+            "--permission-mode",
+            "bypassPermissions",
             "--append-system-prompt",
             system_prompt,
-            "--session-id",
-            self.session_id,
         ]
+        # Turn 1: create the on-disk session with --session-id.
+        # Turn ≥ 2: re-attach with --resume so claude carries forward
+        # its own conversation memory (and we don't have to re-send
+        # `history` ourselves).
+        if self._session_created:
+            argv.extend(["--resume", self.session_id])
+        else:
+            argv.extend(["--session-id", self.session_id])
         if self.model:
             argv.extend(["--model", self.model])
         argv.extend(self.extra_args)
@@ -259,6 +283,14 @@ class ClaudeCliBackend(LLMBackend):
         rc = await proc.wait()
         stderr_bytes = await stderr_task
         stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        # On a clean exit the on-disk session for ``self.session_id`` is
+        # now persisted; subsequent turns must re-attach with --resume,
+        # not --session-id (claude rejects ID reuse). On a failed first
+        # turn we leave the flag false so the caller can retry the
+        # initial create rather than fail with "session not found".
+        if rc == 0 and stop_reason != "error":
+            self._session_created = True
 
         if rc != 0 and stop_reason in (None, "end_turn"):
             yield {
