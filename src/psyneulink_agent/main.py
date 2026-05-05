@@ -1,7 +1,14 @@
 """Console entry point for ``psyneulink-agent``.
 
-Connects to psyneulink-mcp over stdio, lists tools, and optionally calls one.
-No LLM yet — this is the wiring proof (Phase 4).
+Three modes:
+
+* ``--chat`` (interactive) — spawn ``claude`` with the MCP attached and
+  the modeling system prompt. The MVP modeling surface; what users
+  actually want.
+* ``--list-tools`` — print every MCP-exposed tool, one per line. Sanity
+  check that the server is reachable.
+* ``--call TOOL --arg KEY=VALUE`` — invoke one tool directly, no LLM.
+  Useful for debugging tool wiring without burning a chat round.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .chat import chat as run_chat
 from .client import connect_and_call, connect_and_list
 
 if sys.version_info >= (3, 11):
@@ -67,6 +75,15 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Modeling agent for psyneulink-ai — connect to and inspect the MCP server.",
     )
     parser.add_argument(
+        "--chat",
+        action="store_true",
+        default=False,
+        help=(
+            "Drop into an interactive Claude session with psyneulink-mcp "
+            "attached. Requires the `claude` CLI on PATH."
+        ),
+    )
+    parser.add_argument(
         "--list-tools",
         action="store_true",
         default=False,
@@ -75,7 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--call",
         metavar="TOOL",
-        help="Call a tool by name.",
+        help="Call a tool by name (no LLM; for debugging tool wiring).",
     )
     parser.add_argument(
         "--arg",
@@ -162,6 +179,8 @@ def main() -> None:
     ns = _build_parser().parse_args()
     mcp_project = Path(ns.mcp_project) if ns.mcp_project else None
 
+    if ns.chat:
+        sys.exit(run_chat(mcp_project))
     if ns.call:
         try:
             arguments = _parse_tool_args(ns.arg)

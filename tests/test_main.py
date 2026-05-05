@@ -39,6 +39,16 @@ def test_call_with_args_is_parsed() -> None:
     assert ns.arg == ["x=1", "y=hello"]
 
 
+def test_chat_flag_is_parsed() -> None:
+    ns = _build_parser().parse_args(["--chat"])
+    assert ns.chat is True
+
+
+def test_chat_is_false_by_default() -> None:
+    ns = _build_parser().parse_args([])
+    assert ns.chat is False
+
+
 def test_json_flag_is_parsed() -> None:
     ns = _build_parser().parse_args(["--json"])
     assert ns.json is True
