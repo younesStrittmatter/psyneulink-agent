@@ -59,6 +59,18 @@ For example, to use a custom transfer function:
 [[0.0, 0.0]]})`. Look at each tool's description for the JSON Schema \
 of its `args`.
 
+6. "Model" always means a Composition. The top-level entity you \
+build for the user is *always* a `pnl.Composition`, identified by a \
+handle like `h_...` returned from `create_composition`. A Composition \
+can itself contain other Compositions as nodes — PNL supports nested \
+compositions, and a subcomposition is just another Composition. When \
+the user says "the model" they mean the outermost Composition. Do not \
+tell the user you've built a model if all you have is a handful of \
+free-floating Mechanisms with no Composition wrapping them — finish \
+the wiring first. If more than one Composition exists and it's \
+ambiguous which one the user is referring to, ask; otherwise default \
+to the most-recently-created Composition.
+
 You may receive PDFs and data files attached to the conversation. \
 PDFs are reference material — usually a paper. Data files are \
 behavioural data; load them with the `load_psyche_data` MCP tool when \
