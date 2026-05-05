@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from ..config import resolve_server_command
@@ -40,6 +41,24 @@ async def mcp_session(
     cmd = resolve_server_command(mcp_project)
     params = StdioServerParameters(command=cmd[0], args=cmd[1:])
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        yield session
+
+
+@asynccontextmanager
+async def sse_mcp_session(url: str) -> AsyncIterator[ClientSession]:
+    """Connect to a remote SSE MCP endpoint and yield an initialised session.
+
+    Mirrors :func:`mcp_session` but for the SSE transport. Used by
+    :class:`Session.lifespan` when the active LLM backend is
+    :class:`ClaudeCliBackend`: the agent spawns ``psyneulink-mcp
+    --transport sse`` once at session start, then both the per-turn
+    ``claude`` subprocess (via ``--mcp-config``) and the front-end's
+    out-of-loop :meth:`Session.call_tool` invocations connect to the
+    same long-lived MCP so handle / journal / revision state stays
+    coherent.
+    """
+    async with sse_client(url) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
         yield session
 

@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from psyneulink_agent.core.backends import AnthropicSdkBackend, ClaudeCliBackend
 from psyneulink_agent.core.resources import (
     DataResource,
     ModelFileResource,
@@ -357,3 +358,234 @@ def test_send_user_message_inside_lifespan_uses_active_session(
 
     assert len(fake_mcp_session["enters"]) == 1
     assert captured["mcp"] is fake_mcp_session["client"]
+
+
+# ---------------------------------------------------------------------------
+# Default-backend selection
+#
+# Each test below explicitly clears ``PSYNEULINK_LLM_BACKEND`` (the
+# global conftest fixture pins it to ``sdk`` so older tests still see
+# SDK semantics). The selection helper itself is what we want to
+# exercise here.
+# ---------------------------------------------------------------------------
+
+
+def test_default_backend_picks_sdk_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PSYNEULINK_LLM_BACKEND", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    session = Session()
+    assert session.llm_backend.kind == "sdk"
+    assert isinstance(session.llm_backend, AnthropicSdkBackend)
+
+
+def test_default_backend_picks_cli_without_api_key_with_claude_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PSYNEULINK_LLM_BACKEND", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.shutil.which",
+        lambda name: "/usr/bin/claude" if name == "claude" else None,
+    )
+    session = Session()
+    assert session.llm_backend.kind == "cli"
+    assert isinstance(session.llm_backend, ClaudeCliBackend)
+
+
+def test_default_backend_falls_back_to_sdk_when_nothing_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PSYNEULINK_LLM_BACKEND", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr("psyneulink_agent.core.session.shutil.which", lambda name: None)
+    session = Session()
+    assert session.llm_backend.kind == "sdk"
+
+
+def test_default_backend_env_override_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSYNEULINK_LLM_BACKEND", "sdk")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.shutil.which",
+        lambda name: "/usr/bin/claude" if name == "claude" else None,
+    )
+    session = Session()
+    assert session.llm_backend.kind == "sdk"
+
+
+def test_default_backend_env_override_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PSYNEULINK_LLM_BACKEND", "cli")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # would normally win
+    session = Session()
+    assert session.llm_backend.kind == "cli"
+
+
+# ---------------------------------------------------------------------------
+# Lifespan transport selection
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_with_sdk_backend_uses_stdio_mcp(
+    fake_mcp_session: dict[str, Any],
+) -> None:
+    """SDK backend → stdio ``mcp_session``; sse plumbing is never touched."""
+    session = Session(llm_backend=AnthropicSdkBackend())
+
+    async def _go() -> None:
+        async with session.lifespan():
+            assert session._mcp is fake_mcp_session["client"]
+
+    asyncio.run(_go())
+    assert len(fake_mcp_session["enters"]) == 1
+
+
+def test_lifespan_with_cli_backend_spawns_sse_mcp_and_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI backend → ``_spawn_mcp_sse`` + ``sse_mcp_session`` + URL rebound."""
+    backend = ClaudeCliBackend(mcp_url="http://placeholder/sse")
+    session = Session(llm_backend=backend)
+
+    spawn_calls: list[tuple[Any, int]] = []
+    fake_proc = MagicMock(name="FakeMcpProc")
+    fake_proc.terminate = MagicMock()
+    fake_proc.wait = AsyncMock(return_value=0)
+
+    async def _fake_spawn(cmd: Any, port: int, *, timeout: float = 30.0) -> Any:
+        spawn_calls.append((cmd, port))
+        return fake_proc
+
+    sse_enters: list[str] = []
+    fake_client = MagicMock(name="FakeMcpClient")
+
+    @asynccontextmanager
+    async def _fake_sse(url: str) -> AsyncIterator[Any]:
+        sse_enters.append(url)
+        yield fake_client
+
+    # Avoid touching real psyneulink-mcp resolution.
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.resolve_server_command",
+        lambda mcp_project=None: ["/fake/psyneulink-mcp"],
+    )
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session._spawn_mcp_sse", _fake_spawn
+    )
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.sse_mcp_session", _fake_sse
+    )
+
+    async def _go() -> None:
+        async with session.lifespan():
+            assert session._mcp is fake_client
+            assert backend.mcp_url == sse_enters[0]
+            assert backend.mcp_url.startswith("http://127.0.0.1:")
+            assert backend.mcp_url.endswith("/sse")
+
+    asyncio.run(_go())
+
+    assert len(spawn_calls) == 1
+    assert spawn_calls[0][0] == ["/fake/psyneulink-mcp"]
+    assert isinstance(spawn_calls[0][1], int)
+    assert len(sse_enters) == 1
+
+
+def test_lifespan_cli_backend_terminates_subprocess_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ClaudeCliBackend(mcp_url="http://placeholder/sse")
+    session = Session(llm_backend=backend)
+
+    fake_proc = MagicMock(name="FakeMcpProc")
+    fake_proc.terminate = MagicMock()
+    fake_proc.wait = AsyncMock(return_value=0)
+
+    async def _fake_spawn(cmd: Any, port: int, *, timeout: float = 30.0) -> Any:
+        return fake_proc
+
+    fake_client = MagicMock(name="FakeMcpClient")
+
+    @asynccontextmanager
+    async def _fake_sse(url: str) -> AsyncIterator[Any]:
+        yield fake_client
+
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.resolve_server_command",
+        lambda mcp_project=None: ["/fake/psyneulink-mcp"],
+    )
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session._spawn_mcp_sse", _fake_spawn
+    )
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.sse_mcp_session", _fake_sse
+    )
+
+    async def _go() -> None:
+        async with session.lifespan():
+            pass
+
+    asyncio.run(_go())
+
+    fake_proc.terminate.assert_called_once()
+    fake_proc.wait.assert_awaited()
+    assert session._mcp is None
+    assert session._mcp_subprocess is None
+    assert session._mcp_url is None
+
+
+def test_lifespan_cli_backend_cleans_up_temp_mcp_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ClaudeCliBackend(mcp_url="http://placeholder/sse")
+    # Force config creation up front so we can capture the path.
+    cfg_path = backend._build_mcp_config()
+    assert cfg_path.exists()
+
+    session = Session(llm_backend=backend)
+
+    fake_proc = MagicMock()
+    fake_proc.terminate = MagicMock()
+    fake_proc.wait = AsyncMock(return_value=0)
+
+    async def _fake_spawn(cmd: Any, port: int, *, timeout: float = 30.0) -> Any:
+        return fake_proc
+
+    fake_client = MagicMock()
+
+    @asynccontextmanager
+    async def _fake_sse(url: str) -> AsyncIterator[Any]:
+        yield fake_client
+
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.resolve_server_command",
+        lambda mcp_project=None: ["/fake/psyneulink-mcp"],
+    )
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session._spawn_mcp_sse", _fake_spawn
+    )
+    monkeypatch.setattr(
+        "psyneulink_agent.core.session.sse_mcp_session", _fake_sse
+    )
+
+    async def _go() -> None:
+        async with session.lifespan():
+            pass
+
+    asyncio.run(_go())
+
+    assert not cfg_path.exists()
+
+
+def test_send_user_message_outside_lifespan_with_cli_backend_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``lifespan``, the CLI backend has no SSE MCP to talk to → loud error."""
+    backend = ClaudeCliBackend(mcp_url="http://x/sse")
+    session = Session(llm_backend=backend)
+
+    async def _go() -> None:
+        with pytest.raises(RuntimeError, match="lifespan"):
+            async for _ in session.send_user_message("hi"):
+                pass
+
+    asyncio.run(_go())
