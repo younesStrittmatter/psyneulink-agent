@@ -120,6 +120,40 @@ def _pick_free_port() -> int:
         s.close()
 
 
+async def _wait_for_port_open(
+    host: str,
+    port: int,
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.05,
+) -> None:
+    """Poll until ``host:port`` accepts a TCP connection (or timeout).
+
+    psyneulink-mcp prints its readiness line *before* uvicorn calls
+    ``socket.listen()`` — so the stderr signal alone races the actual
+    bind. We close the gap by also dialling the port until it answers.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_exc: Exception | None = None
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=0.5
+            )
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        except (OSError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            await asyncio.sleep(interval)
+    raise RuntimeError(
+        f"psyneulink-mcp printed its readiness line but {host}:{port} "
+        f"did not start accepting TCP connections within {timeout}s "
+        f"(last error: {last_exc!r})"
+    )
+
+
 async def _spawn_mcp_sse(
     cmd: list[str],
     port: int,
@@ -130,11 +164,15 @@ async def _spawn_mcp_sse(
 
     Wires ``PSYNEULINK_MCP_TRANSPORT/HOST/PORT`` via env so the agent
     doesn't have to know whether ``cmd`` already had positional args.
-    The MCP is expected to print ``psyneulink-mcp: serving sse on
-    http://127.0.0.1:<port>/sse`` to stderr once it's listening.
+    The MCP prints ``psyneulink-mcp: serving sse on
+    http://127.0.0.1:<port>/sse`` to stderr once uvicorn boots, but
+    that line fires *before* the listening socket is actually bound,
+    so after seeing it we also poll the port until it's accepting
+    connections.
 
     Raises :class:`RuntimeError` if the readiness line doesn't appear
-    within ``timeout`` seconds, or if the process exits early.
+    within ``timeout`` seconds, if the process exits early, or if the
+    port doesn't open within an additional 10s after the line.
     """
     env = {
         **os.environ,
@@ -177,6 +215,13 @@ async def _spawn_mcp_sse(
             )
         text = line.decode("utf-8", errors="replace")
         if _SSE_READY_SUBSTRING in text and str(port) in text:
+            try:
+                await _wait_for_port_open("127.0.0.1", port)
+            except RuntimeError:
+                proc.terminate()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                raise
             return proc
 
 
