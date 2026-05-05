@@ -1,17 +1,18 @@
 """Interactive chat: spawn ``claude`` CLI with the MCP server attached.
 
-MVP rationale: the user already has Claude Max plan and the ``claude``
-CLI on ``PATH``. ``claude`` natively understands MCP via ``--mcp-config``,
-which means we don't yet need to roll our own LLM tool-calling loop —
-``claude`` does all of that for us, and we get streaming UI, history,
-permissions UI, etc. for free.
+LEGACY PATH — kept intact as the Claude Max fallback.
 
-When this MVP grows up (custom tool routing, prompt caching, modeling-
-strategy logic that needs to live in *our* loop rather than Anthropic's
-generic one), this module is the seam to replace: swap the subprocess
-for an Anthropic SDK loop that owns the conversation while still
-delegating tool execution to the same MCP. The system prompt, MCP
-config, and the user-facing CLI flag (``--chat``) stay unchanged.
+This module wires up ``--chat`` by spawning the ``claude`` CLI with our
+MCP attached via ``--mcp-config``. It survives because users without an
+``ANTHROPIC_API_KEY`` (e.g. Claude Max subscribers using the CLI)
+should still be able to drive the agent against psyneulink-mcp without
+buying API credit.
+
+The newer ``--chat-sdk`` REPL (``psyneulink_agent.repl``) talks to
+Anthropic via the Python SDK directly and is the foundation for the
+upcoming web UI and ``--run`` headless mode. The two front-ends share
+the modeling system prompt via ``psyneulink_agent.core.system_prompt``
+so they can never drift.
 
 Sandboxed environments (Cursor's shell tool) often can't actually run
 this — ``claude`` opens a TTY. Run from a real terminal.
@@ -28,59 +29,9 @@ import tempfile
 from pathlib import Path
 
 from .config import resolve_server_command
+from .core.system_prompt import SYSTEM_PROMPT
 
-SYSTEM_PROMPT = """\
-You are PsyNeuLink Agent, a modeling assistant for cognitive and \
-neural network models built with the PsyNeuLink (PNL) framework.
-
-You have an MCP server attached named `psyneulink`. Every PsyNeuLink \
-class and function the user is likely to need is exposed as an MCP \
-tool. Use the tools — do not write Python or pretend to run code.
-
-How modeling works in this MCP:
-
-1. Each `create_*` tool constructs one PNL object (a Mechanism, a \
-Function, a Composition, a Projection, etc.) and returns a HANDLE \
-shaped like `{"handle": "h_abc123def456", "type": "...", "name": \
-"...", "repr": "..."}`. The `handle` string is the live object's ID \
-in this session — use it everywhere a previously-created object is \
-expected.
-
-2. Construct a model in this order, every time:
-   a. Create the component Mechanisms (`create_transfer_mechanism`, \
-`create_processing_mechanism`, `create_lca_mechanism`, …).
-   b. Create a Composition (`create_composition`).
-   c. Wire mechanisms inside it. For a feed-forward chain use \
-`add_linear_pathway(composition=<h>, nodes=[<h_in>, <h_hidden>, \
-<h_out>])`. For arbitrary topologies use `add_node` + `add_projection` \
-(pass `matrix=` for a custom weight matrix; otherwise PNL chooses).
-   d. Run it with `run_composition(composition=<h>, inputs={<h_input>: \
-[[trial1_values], [trial2_values], ...]})`. PNL inputs are nested \
-lists — the outer dimension is trials, the inner dimension is the \
-node's input shape.
-
-3. Handles are valid as values **inside** any tool's arguments too. \
-For example, to use a custom transfer function:
-   `create_transfer_mechanism(args={"function": "h_<linear_handle>"})`.
-
-4. If you lose track of what exists, call `list_handles`. \
-`describe_handle` gives type / name / repr for one handle.
-
-5. Mechanism arguments live inside an `args` dict:
-   `create_transfer_mechanism(args={"name": "input", "default_variable": \
-[[0.0, 0.0]]})`. Look at each tool's description for the JSON Schema \
-of its `args`.
-
-After building a model, give the user a one-paragraph summary of what \
-was built and (if you ran it) the run output. Be concise — they want \
-models, not essays. If a tool returns an error, fix it and continue \
-rather than dumping the traceback at the user.
-
-You may also use `report_tool_issue` when an MCP tool's description, \
-schema, or behavior is genuinely wrong (not for ordinary modeling \
-errors). The corpus has a feedback loop that consumes those reports \
-into the next regen.
-"""
+__all__ = ["SYSTEM_PROMPT", "chat"]
 
 
 def _build_mcp_config(mcp_project: Path | None) -> dict[str, dict[str, dict[str, object]]]:

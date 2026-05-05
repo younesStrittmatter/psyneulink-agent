@@ -1,10 +1,14 @@
 """Console entry point for ``psyneulink-agent``.
 
-Three modes:
+Modes:
 
 * ``--chat`` (interactive) — spawn ``claude`` with the MCP attached and
-  the modeling system prompt. The MVP modeling surface; what users
-  actually want.
+  the modeling system prompt. The Claude Max fallback for users without
+  an Anthropic API key.
+* ``--chat-sdk`` (interactive) — drive the modeling loop directly via
+  the Anthropic Python SDK. The new default, foundation for the web UI
+  and a future ``--run`` headless mode. Accepts ``--pdf``, ``--data``,
+  ``--model`` to pre-attach resources before the first turn.
 * ``--list-tools`` — print every MCP-exposed tool, one per line. Sanity
   check that the server is reachable.
 * ``--call TOOL --arg KEY=VALUE`` — invoke one tool directly, no LLM.
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -80,7 +85,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Drop into an interactive Claude session with psyneulink-mcp "
-            "attached. Requires the `claude` CLI on PATH."
+            "attached. Requires the `claude` CLI on PATH (Claude Max fallback)."
+        ),
+    )
+    parser.add_argument(
+        "--chat-sdk",
+        action="store_true",
+        default=False,
+        dest="chat_sdk",
+        help=(
+            "Drop into an interactive REPL driven by the Anthropic SDK. "
+            "Requires $ANTHROPIC_API_KEY. Supports /load-pdf, /load-data, "
+            "/load-model, /save-model, /resources, /tools, /help, /exit."
+        ),
+    )
+    parser.add_argument(
+        "--pdf",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help=(
+            "Pre-attach a PDF resource to the SDK chat session "
+            "(may be repeated). Ignored outside --chat-sdk."
+        ),
+    )
+    parser.add_argument(
+        "--data",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help=(
+            "Pre-attach a data file resource to the SDK chat session "
+            "(may be repeated). Ignored outside --chat-sdk."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help=(
+            "Pre-attach a saved .py model file to the SDK chat session "
+            "(may be repeated). Ignored outside --chat-sdk."
         ),
     )
     parser.add_argument(
@@ -170,6 +216,39 @@ async def _run_call(
     return 0
 
 
+def _build_initial_resources(
+    pdfs: list[str], datas: list[str], models: list[str]
+) -> list[Any]:
+    """Construct ``Resource`` instances from CLI flag values, preserving order."""
+    from .core import DataResource, ModelFileResource, PdfResource
+
+    out: list[Any] = []
+    for p in pdfs:
+        out.append(PdfResource(p))
+    for p in datas:
+        out.append(DataResource(p))
+    for p in models:
+        out.append(ModelFileResource(p))
+    return out
+
+
+async def _run_chat_sdk(
+    mcp_project: Path | None,
+    pdfs: list[str],
+    datas: list[str],
+    models: list[str],
+) -> int:
+    from .repl import repl
+
+    try:
+        initial_resources = _build_initial_resources(pdfs, datas, models)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    return await repl(mcp_project, initial_resources) or 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -179,8 +258,30 @@ def main() -> None:
     ns = _build_parser().parse_args()
     mcp_project = Path(ns.mcp_project) if ns.mcp_project else None
 
+    resource_flags_used = bool(ns.pdf or ns.data or ns.model)
+
+    if ns.chat_sdk:
+        sys.exit(asyncio.run(_run_chat_sdk(mcp_project, ns.pdf, ns.data, ns.model)))
+
     if ns.chat:
+        if resource_flags_used:
+            print(
+                "warning: --pdf/--data/--model are ignored with --chat "
+                "(use --chat-sdk to attach resources).",
+                file=sys.stderr,
+            )
+        # Auto-detect notice: surface the SDK alternative without forcing a
+        # switch — the user explicitly chose --chat.
+        if (
+            os.environ.get("ANTHROPIC_API_KEY")
+            and os.environ.get("PSYNEULINK_AGENT_USE_CLI") != "1"
+        ):
+            print(
+                "note: $ANTHROPIC_API_KEY is set; --chat-sdk is also available.",
+                file=sys.stderr,
+            )
         sys.exit(run_chat(mcp_project))
+
     if ns.call:
         try:
             arguments = _parse_tool_args(ns.arg)
@@ -189,7 +290,6 @@ def main() -> None:
             sys.exit(1)
         sys.exit(asyncio.run(_run_call(ns.call, arguments, mcp_project, ns.json)))
     else:
-        # --list-tools or bare invocation
         sys.exit(asyncio.run(_run_list(mcp_project, ns.json)))
 
 

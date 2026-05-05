@@ -49,6 +49,44 @@ def test_chat_is_false_by_default() -> None:
     assert ns.chat is False
 
 
+def test_chat_sdk_flag_is_parsed() -> None:
+    ns = _build_parser().parse_args(["--chat-sdk"])
+    assert ns.chat_sdk is True
+    assert ns.chat is False
+
+
+def test_chat_sdk_is_false_by_default() -> None:
+    ns = _build_parser().parse_args([])
+    assert ns.chat_sdk is False
+
+
+def test_pdf_data_model_flags_default_to_empty_lists() -> None:
+    ns = _build_parser().parse_args([])
+    assert ns.pdf == []
+    assert ns.data == []
+    assert ns.model == []
+
+
+def test_pdf_data_model_flags_accumulate() -> None:
+    ns = _build_parser().parse_args(
+        [
+            "--chat-sdk",
+            "--pdf",
+            "/p/a.pdf",
+            "--pdf",
+            "/p/b.pdf",
+            "--data",
+            "/d/x.csv",
+            "--model",
+            "/m/m.py",
+        ]
+    )
+    assert ns.chat_sdk is True
+    assert ns.pdf == ["/p/a.pdf", "/p/b.pdf"]
+    assert ns.data == ["/d/x.csv"]
+    assert ns.model == ["/m/m.py"]
+
+
 def test_json_flag_is_parsed() -> None:
     ns = _build_parser().parse_args(["--json"])
     assert ns.json is True
