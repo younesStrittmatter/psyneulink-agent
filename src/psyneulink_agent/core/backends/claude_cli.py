@@ -154,31 +154,17 @@ class ClaudeCliBackend(LLMBackend):
         mcp: Any,
         tools: list[dict[str, Any]],
     ) -> AsyncIterator[dict[str, Any]]:
-        prompt_parts: list[str] = []
-        ignored: list[str] = []
-        for block in user_content:
-            if block.get("type") == "text":
-                prompt_parts.append(block.get("text", ""))
-            else:
-                ignored.append(block.get("type") or "<unknown>")
-        prompt = "\n\n".join(prompt_parts)
-
-        if ignored:
-            yield {
-                "type": "warning",
-                "message": (
-                    f"ClaudeCliBackend ignored non-text content blocks "
-                    f"({', '.join(ignored)}). Claude CLI's stdin protocol "
-                    f"doesn't accept rich blocks yet; describe the "
-                    f"attachment in text instead."
-                ),
-            }
-
         config_path = self._build_mcp_config()
 
         argv = [
             self.claude_path,
             "--print",
+            # Stream-json BOTH ways: input keeps Anthropic content blocks
+            # intact (PDF documents, images, etc.) instead of forcing
+            # everything through a flattened text prompt; output gives us
+            # the structured event stream we already parse.
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--include-partial-messages",
@@ -187,6 +173,19 @@ class ClaudeCliBackend(LLMBackend):
             "--verbose",
             "--mcp-config",
             str(config_path),
+            # Don't load any other MCP servers the user happens to have
+            # configured globally (Gmail, Slack, etc.) — the agent
+            # should see the psyneulink MCP and nothing else.
+            "--strict-mcp-config",
+            # Disable Claude Code's built-in tools (Read, Bash, Edit,
+            # Write, Grep, …). Without this the agent is happy to
+            # `Read` arbitrary filesystem paths it sees mentioned in
+            # the conversation, which is both the wrong abstraction
+            # for a modelling agent and a real footgun (it can also
+            # Bash / Edit / Write). MCP tools come via --mcp-config and
+            # are unaffected.
+            "--tools",
+            "",
             "--append-system-prompt",
             system_prompt,
             "--session-id",
@@ -196,8 +195,22 @@ class ClaudeCliBackend(LLMBackend):
             argv.extend(["--model", self.model])
         argv.extend(self.extra_args)
 
-        # Pass the prompt via stdin to avoid argv-escape issues with
-        # multi-line user messages.
+        # Build a stream-json user message carrying ALL content blocks
+        # verbatim (PDF document blocks included). Anthropic's content
+        # block schema is preserved end-to-end, so PDFs ride as native
+        # document blocks instead of being flattened to text + a
+        # follow-up `Read` call.
+        message_line = json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": user_content,
+                },
+            },
+            ensure_ascii=False,
+        )
+
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
@@ -206,9 +219,8 @@ class ClaudeCliBackend(LLMBackend):
         )
         assert proc.stdin is not None and proc.stdout is not None
 
-        if prompt:
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
+        proc.stdin.write(message_line.encode("utf-8") + b"\n")
+        await proc.stdin.drain()
         proc.stdin.close()
 
         # Drain stderr concurrently to prevent pipe back-pressure

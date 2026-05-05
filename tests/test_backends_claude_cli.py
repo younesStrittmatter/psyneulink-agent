@@ -210,10 +210,15 @@ def test_run_turn_spawns_claude_with_expected_argv(monkeypatch) -> None:
     argv = capture["argv_history"][0]
     assert argv[0] == "/fake/claude"
     assert "--print" in argv
-    idx = argv.index("--output-format")
-    assert argv[idx + 1] == "stream-json"
+    out_idx = argv.index("--output-format")
+    assert argv[out_idx + 1] == "stream-json"
+    in_idx = argv.index("--input-format")
+    assert argv[in_idx + 1] == "stream-json"
     assert "--include-partial-messages" in argv
     assert "--verbose" in argv
+    assert "--strict-mcp-config" in argv
+    tools_idx = argv.index("--tools")
+    assert argv[tools_idx + 1] == ""
     assert "--mcp-config" in argv
     assert cfg_data["mcpServers"]["psyneulink"]["url"] == "http://127.0.0.1:1234/sse"
     sp_idx = argv.index("--append-system-prompt")
@@ -223,9 +228,19 @@ def test_run_turn_spawns_claude_with_expected_argv(monkeypatch) -> None:
     m_idx = argv.index("--model")
     assert argv[m_idx + 1] == "claude-test"
 
-    # Prompt is delivered via stdin, not argv.
+    # Prompt is delivered via stdin as a stream-json user message line.
     proc = capture["procs"][0]
-    assert proc.stdin.written == [b"hello"]
+    assert len(proc.stdin.written) == 1
+    payload = proc.stdin.written[0]
+    assert payload.endswith(b"\n")
+    msg = json.loads(payload)
+    assert msg == {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+        },
+    }
     assert proc.stdin.closed
 
 
@@ -490,20 +505,31 @@ def test_run_turn_surfaces_nonzero_exit_as_tool_result_error(monkeypatch) -> Non
     assert events[-1] == {"type": "turn_complete", "stop_reason": "error"}
 
 
-def test_run_turn_warns_on_non_text_content_blocks(monkeypatch) -> None:
-    _install_fake_subprocess(
+def test_run_turn_pipes_full_content_blocks_via_stream_json(monkeypatch) -> None:
+    """PDF document blocks (and any non-text block) ride through verbatim
+    in the stream-json user message — no warning, no flattening."""
+    capture = _install_fake_subprocess(
         monkeypatch,
         stdout_lines=[_line(_success_result())],
     )
     backend = ClaudeCliBackend(mcp_url="http://x/sse")
+    pdf_block = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjQ=",  # tiny "%PDF-1.4" stub, base64
+        },
+        "title": "paper.pdf",
+    }
     try:
         events = _drive(
             backend.run_turn(
                 history=[],
                 system_prompt="s",
                 user_content=[
-                    {"type": "document", "source": {"type": "base64", "data": "x"}},
-                    {"type": "text", "text": "describe attached doc"},
+                    pdf_block,
+                    {"type": "text", "text": "summarise this paper"},
                 ],
                 mcp=object(),
                 tools=[],
@@ -512,9 +538,16 @@ def test_run_turn_warns_on_non_text_content_blocks(monkeypatch) -> None:
     finally:
         backend.cleanup()
 
-    warnings = [e for e in events if e["type"] == "warning"]
-    assert len(warnings) == 1
-    assert "document" in warnings[0]["message"]
+    # No warning event — non-text blocks are first-class now.
+    assert [e for e in events if e["type"] == "warning"] == []
+
+    # The PDF block landed on stdin verbatim.
+    proc = capture["procs"][0]
+    assert len(proc.stdin.written) == 1
+    msg = json.loads(proc.stdin.written[0])
+    sent_content = msg["message"]["content"]
+    assert sent_content[0] == pdf_block
+    assert sent_content[1] == {"type": "text", "text": "summarise this paper"}
 
 
 def test_run_turn_passes_session_id_for_multi_turn(monkeypatch) -> None:
