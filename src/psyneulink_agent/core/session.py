@@ -18,6 +18,12 @@ Front-ends (the ``--chat-sdk`` REPL, the upcoming web UI, the future
 
 * ``attach`` / ``detach`` / ``resources``
 * ``send_user_message(text)`` — async iterator yielding events
+* ``cancel_current_turn()`` — interrupt the in-flight turn (if any).
+  Both backends honour it: the SDK loop bails between LLM round-trips
+  and yields ``{"type": "turn_cancelled"}``; the CLI backend kills its
+  ``claude`` subprocess (SIGTERM, then SIGKILL after a short grace)
+  so its streaming stdout loop unblocks. Returns ``True`` if a turn
+  was interrupted, ``False`` if no turn was in flight.
 * ``lifespan()`` — async context manager that holds one MCP session
   open for the duration of the front-end (web UI, long REPL); inside
   it, ``send_user_message`` and ``call_tool`` reuse the same MCP
@@ -245,6 +251,12 @@ class Session:
     # the SSE psyneulink-mcp subprocess and the URL it's listening on.
     _mcp_subprocess: Any | None = field(default=None, init=False, repr=False)
     _mcp_url: str | None = field(default=None, init=False, repr=False)
+    # Per-turn cancellation flag. Created at the top of every
+    # ``send_user_message`` call and cleared in its ``finally`` so
+    # ``cancel_current_turn()`` is a no-op when nothing is running.
+    # Front-ends never touch this directly — they call
+    # ``cancel_current_turn()``.
+    _cancel_event: asyncio.Event | None = field(default=None, init=False, repr=False)
 
     def attach(self, resource: Resource) -> None:
         self.resources.append(resource)
@@ -254,6 +266,34 @@ class Session:
 
     def system_prompt(self) -> str:
         return render_system_prompt(self.resources)
+
+    def cancel_current_turn(self) -> bool:
+        """Signal cancellation of the in-flight ``send_user_message`` turn.
+
+        Sets the per-turn cancellation event that backends watch. The
+        SDK backend exits cleanly between LLM round-trips and yields a
+        single ``{"type": "turn_cancelled"}`` event; the CLI backend
+        kills its ``claude`` subprocess (SIGTERM, then SIGKILL after a
+        short grace) so its streaming stdout loop unblocks and the
+        same ``turn_cancelled`` event fires before ``run_turn``
+        returns.
+
+        Safe to call from any thread/task — the underlying
+        :class:`asyncio.Event` is thread-safe for ``set()``. Idempotent
+        within a single turn.
+
+        Returns:
+            ``True`` if a turn was in flight and the cancel signal was
+            delivered; ``False`` if no turn was active (the front-end
+            should treat this as "nothing to cancel" rather than an
+            error). Front-ends typically wire this to a Stop button —
+            see ``psyneulink-ui``'s ``POST /api/sessions/{sid}/cancel``.
+        """
+        ev = self._cancel_event
+        if ev is None:
+            return False
+        ev.set()
+        return True
 
     @asynccontextmanager
     async def lifespan(self) -> AsyncIterator[Session]:
@@ -403,36 +443,43 @@ class Session:
                 content_blocks.extend(res.as_anthropic_blocks())
         content_blocks.append({"type": "text", "text": text})
 
-        if self._mcp is not None:
-            tools = await list_anthropic_tools(self._mcp)
-            async for event in backend.run_turn(
-                history=self.history,
-                system_prompt=self.system_prompt(),
-                user_content=content_blocks,
-                mcp=self._mcp,
-                tools=tools,
-            ):
-                yield event
-            return
+        cancel_event = asyncio.Event()
+        self._cancel_event = cancel_event
+        try:
+            if self._mcp is not None:
+                tools = await list_anthropic_tools(self._mcp)
+                async for event in backend.run_turn(
+                    history=self.history,
+                    system_prompt=self.system_prompt(),
+                    user_content=content_blocks,
+                    mcp=self._mcp,
+                    tools=tools,
+                    cancel_event=cancel_event,
+                ):
+                    yield event
+                return
 
-        if backend.kind == "cli":
-            raise RuntimeError(
-                "ClaudeCliBackend requires an active Session.lifespan() — "
-                "the SSE MCP server is started there. Wrap your front-end "
-                "in `async with session.lifespan(): ...` before sending "
-                "user messages."
-            )
+            if backend.kind == "cli":
+                raise RuntimeError(
+                    "ClaudeCliBackend requires an active Session.lifespan() — "
+                    "the SSE MCP server is started there. Wrap your front-end "
+                    "in `async with session.lifespan(): ...` before sending "
+                    "user messages."
+                )
 
-        async with mcp_session(self.mcp_project) as mcp:
-            tools = await list_anthropic_tools(mcp)
-            async for event in backend.run_turn(
-                history=self.history,
-                system_prompt=self.system_prompt(),
-                user_content=content_blocks,
-                mcp=mcp,
-                tools=tools,
-            ):
-                yield event
+            async with mcp_session(self.mcp_project) as mcp:
+                tools = await list_anthropic_tools(mcp)
+                async for event in backend.run_turn(
+                    history=self.history,
+                    system_prompt=self.system_prompt(),
+                    user_content=content_blocks,
+                    mcp=mcp,
+                    tools=tools,
+                    cancel_event=cancel_event,
+                ):
+                    yield event
+        finally:
+            self._cancel_event = None
 
     def snapshot(self) -> dict[str, Any]:
         """JSON-serialisable summary of the session.

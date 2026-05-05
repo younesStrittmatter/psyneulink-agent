@@ -160,8 +160,13 @@ class ClaudeCliBackend(LLMBackend):
         user_content: list[dict[str, Any]],
         mcp: Any,
         tools: list[dict[str, Any]],
+        cancel_event: asyncio.Event | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         config_path = self._build_mcp_config()
+
+        if cancel_event is not None and cancel_event.is_set():
+            yield {"type": "turn_cancelled"}
+            return
 
         argv = [
             self.claude_path,
@@ -259,26 +264,57 @@ class ClaudeCliBackend(LLMBackend):
 
         stderr_task = asyncio.create_task(_drain(proc.stderr))
 
+        # Cancel watcher: when the front-end calls
+        # ``Session.cancel_current_turn()``, ``cancel_event`` flips.
+        # We translate that into a SIGTERM (then SIGKILL grace) on the
+        # ``claude`` subprocess so the streaming stdout loop unblocks
+        # promptly. The ``cancelled`` flag tells the post-loop code to
+        # emit ``turn_cancelled`` instead of ``turn_complete``.
+        cancel_state = {"cancelled": False}
+        cancel_watcher_task: asyncio.Task[None] | None = None
+        if cancel_event is not None:
+
+            async def _cancel_watcher() -> None:
+                await cancel_event.wait()
+                cancel_state["cancelled"] = True
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    return
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+
+            cancel_watcher_task = asyncio.create_task(_cancel_watcher())
+
         assistant_chunks: list[str] = []
         seen_tool_uses: dict[str, dict[str, Any]] = {}
         stop_reason: str | None = None
 
-        async for raw_line in proc.stdout:
-            text_line = raw_line.strip()
-            if not text_line:
-                continue
-            try:
-                event = json.loads(text_line)
-            except json.JSONDecodeError:
-                continue
+        try:
+            async for raw_line in proc.stdout:
+                text_line = raw_line.strip()
+                if not text_line:
+                    continue
+                try:
+                    event = json.loads(text_line)
+                except json.JSONDecodeError:
+                    continue
 
-            translated, side_effects = _translate_claude_event(
-                event, assistant_chunks, seen_tool_uses
-            )
-            for ev in translated:
-                yield ev
-            if side_effects.get("stop_reason"):
-                stop_reason = side_effects["stop_reason"]
+                translated, side_effects = _translate_claude_event(
+                    event, assistant_chunks, seen_tool_uses
+                )
+                for ev in translated:
+                    yield ev
+                if side_effects.get("stop_reason"):
+                    stop_reason = side_effects["stop_reason"]
+        finally:
+            if cancel_watcher_task is not None:
+                cancel_watcher_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await cancel_watcher_task
 
         rc = await proc.wait()
         stderr_bytes = await stderr_task
@@ -291,6 +327,12 @@ class ClaudeCliBackend(LLMBackend):
         # initial create rather than fail with "session not found".
         if rc == 0 and stop_reason != "error":
             self._session_created = True
+
+        if cancel_state["cancelled"]:
+            # Don't conflate user cancellation with a real CLI failure,
+            # even though ``proc.terminate()`` produces a non-zero rc.
+            yield {"type": "turn_cancelled"}
+            return
 
         if rc != 0 and stop_reason in (None, "end_turn"):
             yield {

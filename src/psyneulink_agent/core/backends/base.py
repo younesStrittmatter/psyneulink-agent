@@ -15,6 +15,7 @@ reach into backend internals.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Any
@@ -36,6 +37,7 @@ class LLMBackend(ABC):
         user_content: list[dict[str, Any]],
         mcp: Any,
         tools: list[dict[str, Any]],
+        cancel_event: asyncio.Event | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Drive one user-turn → assistant-turn cycle.
 
@@ -48,4 +50,14 @@ class LLMBackend(ABC):
         calls through the agent itself (the SDK backend). Backends that
         delegate tool wiring to the LLM client (the CLI backend, where
         ``claude`` reads the MCP config directly) may ignore them.
+
+        ``cancel_event`` is the cooperative cancellation signal:
+        :meth:`Session.cancel_current_turn` flips it, and a backend
+        that supports cancellation must observe it (between LLM
+        round-trips for the SDK, by killing the spawned ``claude``
+        subprocess for the CLI), then yield a single
+        ``{"type": "turn_cancelled"}`` event before returning. Backends
+        may legitimately ignore the parameter — older / simpler
+        implementations will just run to completion — but every front-
+        end-facing backend in this repo honours it.
         """

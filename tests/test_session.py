@@ -589,3 +589,114 @@ def test_send_user_message_outside_lifespan_with_cli_backend_raises(
                 pass
 
     asyncio.run(_go())
+
+
+# ---------------------------------------------------------------------------
+# cancel_current_turn() — Stop button hook for the web UI
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_current_turn_returns_false_when_no_turn_in_flight() -> None:
+    """No turn → no event to flip → idempotent ``False``, never raises."""
+    session = Session()
+    assert session.cancel_current_turn() is False
+    assert session.cancel_current_turn() is False
+
+
+def test_cancel_current_turn_during_long_running_turn_yields_turn_cancelled(
+    fake_mcp_session: dict[str, Any],
+) -> None:
+    """The Stop button's contract: the in-flight ``send_user_message``
+    must yield exactly one ``turn_cancelled`` event and stop cleanly.
+
+    We drive a fake backend whose ``run_turn`` waits on the
+    ``cancel_event`` it's handed, mirroring how the real SDK loop
+    reacts to a flipped flag between LLM round-trips.
+    """
+
+    class _CancelHonouringBackend:
+        kind = "sdk"
+
+        async def run_turn(
+            self,
+            *,
+            history: list[dict[str, Any]],
+            system_prompt: str,
+            user_content: list[dict[str, Any]],
+            mcp: Any,
+            tools: list[dict[str, Any]],
+            cancel_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            yield {"type": "text_chunk", "delta": "starting…"}
+            assert cancel_event is not None
+            await cancel_event.wait()
+            yield {"type": "turn_cancelled"}
+
+    session = Session(llm_backend=_CancelHonouringBackend())
+    fake_mcp_session["client"].list_tools = AsyncMock(
+        return_value=MagicMock(tools=[])
+    )
+
+    async def _go() -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        async with session.lifespan():
+            agen = session.send_user_message("long task")
+            first = await agen.__anext__()
+            events.append(first)
+            assert session.cancel_current_turn() is True
+            async for ev in agen:
+                events.append(ev)
+        return events
+
+    events = asyncio.run(_go())
+    types = [e["type"] for e in events]
+    assert types == ["text_chunk", "turn_cancelled"]
+    # And after the turn ends, the cancel hook returns to its ``False``
+    # default — front-ends can poll it without spurious "yes I cancelled".
+    assert session.cancel_current_turn() is False
+
+
+def test_cancel_event_is_cleared_between_turns(
+    fake_mcp_session: dict[str, Any],
+) -> None:
+    """Two back-to-back turns get fresh cancel events; setting one in
+    turn N doesn't haunt turn N+1."""
+
+    class _OneShotBackend:
+        kind = "sdk"
+
+        def __init__(self) -> None:
+            self.events_seen_per_turn: list[list[asyncio.Event | None]] = []
+
+        async def run_turn(
+            self,
+            *,
+            history: list[dict[str, Any]],
+            system_prompt: str,
+            user_content: list[dict[str, Any]],
+            mcp: Any,
+            tools: list[dict[str, Any]],
+            cancel_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.events_seen_per_turn.append([cancel_event])
+            yield {"type": "text_chunk", "delta": "ok"}
+            yield {"type": "turn_complete", "stop_reason": "end_turn"}
+
+    backend = _OneShotBackend()
+    session = Session(llm_backend=backend)
+    fake_mcp_session["client"].list_tools = AsyncMock(
+        return_value=MagicMock(tools=[])
+    )
+
+    async def _go() -> None:
+        async with session.lifespan():
+            async for _ in session.send_user_message("a"):
+                pass
+            async for _ in session.send_user_message("b"):
+                pass
+
+    asyncio.run(_go())
+    a_event = backend.events_seen_per_turn[0][0]
+    b_event = backend.events_seen_per_turn[1][0]
+    assert a_event is not None and b_event is not None
+    assert a_event is not b_event

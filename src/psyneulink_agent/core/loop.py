@@ -23,6 +23,8 @@ Design constraints:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -53,6 +55,7 @@ async def run_turn(
     tools: list[dict[str, Any]],
     max_tool_iterations: int = 16,
     max_tokens: int = 4096,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """One full user-turn → assistant-turn cycle, possibly with tool calls.
 
@@ -62,21 +65,46 @@ async def run_turn(
     * ``{"type": "tool_use", "id": "...", "name": "...", "input": {...}}``
     * ``{"type": "tool_result", "id": "...", "name": "...", "content": "..."}``
     * ``{"type": "turn_complete", "stop_reason": "..."}``
+    * ``{"type": "turn_cancelled"}`` — only when ``cancel_event`` was
+      passed and got set during this turn
 
     On completion, ``history`` has the user turn and every assistant +
     tool-result message appended in order, so the next turn just calls
     ``run_turn`` again with another ``user_content``.
+
+    Cancellation
+    ------------
+
+    If ``cancel_event`` is supplied (typically by ``Session`` so its
+    public ``cancel_current_turn()`` has something to flip), it is
+    checked at the top of each tool-iteration *and* concurrently with
+    the in-flight ``messages.create`` call. When set, ``run_turn``
+    yields a single ``{"type": "turn_cancelled"}`` event and returns
+    cleanly. Cancellation is only honoured *between* completed
+    iterations — once an assistant response has been received, its
+    tool_use blocks are run to ``tool_result`` so ``history`` stays
+    well-formed (the Anthropic API rejects an unanswered ``tool_use``
+    on the next turn).
     """
     history.append({"role": "user", "content": user_content})
 
     for _ in range(max_tool_iterations):
-        response = await anthropic_client.messages.create(
+        if cancel_event is not None and cancel_event.is_set():
+            yield {"type": "turn_cancelled"}
+            return
+
+        response = await _create_or_cancel(
+            anthropic_client=anthropic_client,
             model=model,
-            system=system_prompt,
-            messages=history,
+            system_prompt=system_prompt,
+            history=history,
             tools=tools,
             max_tokens=max_tokens,
+            cancel_event=cancel_event,
         )
+        if response is None:
+            yield {"type": "turn_cancelled"}
+            return
 
         assistant_blocks = [_block_to_dict(b) for b in response.content]
         history.append({"role": "assistant", "content": assistant_blocks})
@@ -131,3 +159,61 @@ async def run_turn(
         history.append({"role": "user", "content": tool_results})
 
     yield {"type": "turn_complete", "stop_reason": "tool_iteration_cap"}
+
+
+async def _create_or_cancel(
+    *,
+    anthropic_client: Any,
+    model: str,
+    system_prompt: str,
+    history: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    cancel_event: asyncio.Event | None,
+) -> Any:
+    """Await ``messages.create`` while honouring ``cancel_event``.
+
+    Returns the response on success, or ``None`` if cancellation was
+    signalled before the response arrived. Cancelling the in-flight
+    create task lets ``anthropic``'s underlying httpx client tear down
+    the network request promptly instead of blocking until the model
+    finishes.
+    """
+    if cancel_event is None:
+        return await anthropic_client.messages.create(
+            model=model,
+            system=system_prompt,
+            messages=history,
+            tools=tools,
+            max_tokens=max_tokens,
+        )
+
+    create_task = asyncio.create_task(
+        anthropic_client.messages.create(
+            model=model,
+            system=system_prompt,
+            messages=history,
+            tools=tools,
+            max_tokens=max_tokens,
+        )
+    )
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {create_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except BaseException:
+        create_task.cancel()
+        cancel_task.cancel()
+        raise
+
+    for t in pending:
+        t.cancel()
+    for t in pending:
+        with contextlib.suppress(BaseException):
+            await t
+
+    if cancel_task in done:
+        return None
+    return create_task.result()

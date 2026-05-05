@@ -656,6 +656,108 @@ def test_run_turn_skips_unknown_event_shapes_silently(monkeypatch) -> None:
     assert events[-1] == {"type": "turn_complete", "stop_reason": "end_turn"}
 
 
+def test_run_turn_cancel_event_kills_subprocess_and_yields_turn_cancelled(
+    monkeypatch,
+) -> None:
+    """``cancel_current_turn()`` flips the event; the CLI backend must
+    ``terminate()`` the subprocess so the streaming stdout loop unblocks
+    and the run yields a single ``turn_cancelled`` event before
+    ``turn_complete`` ever fires."""
+
+    cancel_event = asyncio.Event()
+    teardown_signal = asyncio.Event()
+    terminate_calls: list[int] = []
+
+    class _BlockingStream:
+        """Async-iterable that hangs forever — until ``teardown_signal`` fires.
+
+        Mirrors what real subprocess stdout looks like before the model
+        decides it's done: nothing comes out, the consumer await-blocks.
+        ``ClaudeCliBackend``'s cancel watcher should call ``terminate()``
+        on the proc when the event flips, which (in the real world)
+        flushes stdout and EOFs the pipe — we model that by setting
+        ``teardown_signal`` from the fake ``terminate()``.
+        """
+
+        def __aiter__(self) -> _BlockingStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            await teardown_signal.wait()
+            raise StopAsyncIteration
+
+        async def read(self, n: int = -1) -> bytes:
+            return b""
+
+    class _CancellableProc:
+        def __init__(self) -> None:
+            self.stdout = _BlockingStream()
+            self.stderr = _BlockingStream()
+            self.stdin = _FakeStdin()
+            self._returncode = -15  # SIGTERM-ish
+
+        @property
+        def returncode(self) -> int:
+            return self._returncode
+
+        def terminate(self) -> None:
+            terminate_calls.append(1)
+            teardown_signal.set()
+
+        def kill(self) -> None:
+            teardown_signal.set()
+
+        async def wait(self) -> int:
+            await teardown_signal.wait()
+            return self._returncode
+
+    proc = _CancellableProc()
+
+    async def _fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> _CancellableProc:
+        return proc
+
+    monkeypatch.setattr(
+        "psyneulink_agent.core.backends.claude_cli.asyncio.create_subprocess_exec",
+        _fake_create_subprocess_exec,
+    )
+
+    backend = ClaudeCliBackend(mcp_url="http://x/sse")
+
+    async def _drive_with_cancel() -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        agen = backend.run_turn(
+            history=[],
+            system_prompt="s",
+            user_content=[{"type": "text", "text": "long task"}],
+            mcp=object(),
+            tools=[],
+            cancel_event=cancel_event,
+        )
+
+        async def _consume() -> None:
+            async for ev in agen:
+                events.append(ev)
+
+        consumer = asyncio.create_task(_consume())
+        # Let the generator spawn the subprocess and install its
+        # cancel watcher before we flip the flag. A few yields is
+        # plenty — the cancel-watcher task has to be scheduled.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        cancel_event.set()
+        await consumer
+        return events
+
+    try:
+        events = asyncio.run(asyncio.wait_for(_drive_with_cancel(), timeout=5.0))
+    finally:
+        backend.cleanup()
+
+    assert terminate_calls == [1]
+    assert any(e["type"] == "turn_cancelled" for e in events)
+    assert all(e["type"] != "turn_complete" for e in events)
+
+
 def test_run_turn_treats_result_is_error_as_error_stop_reason(monkeypatch) -> None:
     _install_fake_subprocess(
         monkeypatch,

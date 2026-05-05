@@ -230,6 +230,87 @@ def test_run_turn_tool_iteration_cap_emits_synthetic_complete() -> None:
     assert last == {"type": "turn_complete", "stop_reason": "tool_iteration_cap"}
 
 
+def test_run_turn_cancel_event_set_before_first_iteration_emits_turn_cancelled() -> None:
+    """If the cancel flag is already set when ``run_turn`` starts, we
+    bail before hitting the network: no ``messages.create`` call, one
+    ``turn_cancelled`` event, done."""
+    history: list[dict[str, Any]] = []
+    fake_messages = _FakeMessages(scripted=[])
+    anthropic = _FakeAnthropic(messages=fake_messages)
+
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+
+    events = _drive(
+        run_turn(
+            anthropic_client=anthropic,
+            model="claude-test",
+            system_prompt="sys",
+            history=history,
+            user_content=[{"type": "text", "text": "irrelevant"}],
+            mcp=_FakeMCP(),
+            tools=[],
+            cancel_event=cancel_event,
+        )
+    )
+
+    assert events == [{"type": "turn_cancelled"}]
+    assert fake_messages.calls == []
+
+
+def test_run_turn_cancel_during_messages_create_emits_turn_cancelled() -> None:
+    """Flipping the cancel flag while ``messages.create`` is awaited
+    must cause that in-flight request to be cancelled and the loop to
+    exit with a single ``turn_cancelled`` event — proving the
+    interruptible await wraps the SDK call, not just the iteration
+    boundary."""
+    history: list[dict[str, Any]] = []
+    cancel_event = asyncio.Event()
+    create_started = asyncio.Event()
+
+    class _SlowMessages:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def create(self, **kwargs: Any) -> _Message:
+            self.calls.append(kwargs)
+            create_started.set()
+            await asyncio.sleep(60)
+            raise AssertionError("messages.create should have been cancelled")
+
+    @dataclass
+    class _SlowAnthropic:
+        messages: _SlowMessages
+
+    anthropic = _SlowAnthropic(messages=_SlowMessages())
+
+    async def _drive_with_cancel() -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        agen = run_turn(
+            anthropic_client=anthropic,
+            model="claude-test",
+            system_prompt="sys",
+            history=history,
+            user_content=[{"type": "text", "text": "long task"}],
+            mcp=_FakeMCP(),
+            tools=[],
+            cancel_event=cancel_event,
+        )
+
+        async def _trip_cancel() -> None:
+            await create_started.wait()
+            cancel_event.set()
+
+        canceller = asyncio.create_task(_trip_cancel())
+        async for ev in agen:
+            events.append(ev)
+        await canceller
+        return events
+
+    events = asyncio.run(asyncio.wait_for(_drive_with_cancel(), timeout=5.0))
+    assert events == [{"type": "turn_cancelled"}]
+
+
 def test_run_turn_records_tool_error_without_crashing() -> None:
     history: list[dict[str, Any]] = []
 

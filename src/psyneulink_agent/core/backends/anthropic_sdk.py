@@ -8,6 +8,7 @@ transport in this mode is stdio (handled by ``Session.lifespan()``);
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from typing import Any
@@ -42,6 +43,7 @@ class AnthropicSdkBackend(LLMBackend):
         user_content: list[dict[str, Any]],
         mcp: Any,
         tools: list[dict[str, Any]],
+        cancel_event: asyncio.Event | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # Lazy import via the session module so tests that monkeypatch
         # ``psyneulink_agent.core.session.run_turn`` (the original
@@ -63,5 +65,6 @@ class AnthropicSdkBackend(LLMBackend):
             user_content=user_content,
             mcp=mcp,
             tools=tools,
+            cancel_event=cancel_event,
         ):
             yield event
