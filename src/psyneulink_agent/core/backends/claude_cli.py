@@ -240,11 +240,21 @@ class ClaudeCliBackend(LLMBackend):
             ensure_ascii=False,
         )
 
+        # 16 MB stdout buffer (default 64 KB is too small for claude
+        # CLI JSON lines that contain large tool_results — e.g. the
+        # full `describe_psyneulink_tool` payload for EMComposition-
+        # family tools, the full PNL source of a big Composition, or
+        # an attached PDF's content block). LimitOverrunError here
+        # silently kills the reader task and the whole turn ends with
+        # no events surfaced to the user. Mirror of the same fix in
+        # `orchestrator-agent/core/backends/claude_cli.py`.
+        _STREAM_LIMIT = 16 * 1024 * 1024  # 16 MB
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
         )
         assert proc.stdin is not None and proc.stdout is not None
 
