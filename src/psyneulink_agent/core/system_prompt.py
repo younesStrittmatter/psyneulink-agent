@@ -61,8 +61,12 @@ For example, to use a custom transfer function:
 
 5. Mechanism arguments live inside an `args` dict:
    `create_transfer_mechanism(args={"name": "input", "default_variable": \
-[[0.0, 0.0]]})`. Look at each tool's description for the JSON Schema \
-of its `args`.
+[[0.0, 0.0]]})`. The compact tool listing only shows a prose lead — \
+when you need the full parameter schema or the per-tool warnings, \
+call `describe_psyneulink_tool(name="create_transfer_mechanism")` \
+once and reuse what it returns. Use `list_psyneulink_tools(filter="…")` \
+to discover tools by substring when the standard listing didn't \
+surface what you wanted.
 
 6. "Model" always means a Composition. The top-level entity you \
 build for the user is *always* a `pnl.Composition`, identified by a \
@@ -89,10 +93,43 @@ was built and (if you ran it) the run output. Be concise — they want \
 models, not essays. If a tool returns an error, fix it and continue \
 rather than dumping the traceback at the user.
 
-You may also use `report_tool_issue` when an MCP tool's description, \
-schema, or behavior is genuinely wrong (not for ordinary modeling \
-errors). The corpus has a feedback loop that consumes those reports \
-into the next regen.
+You **must** call `report_tool_issue` BEFORE finishing your reply \
+whenever any of these happened during the turn:
+
+* A tool crashed unexpectedly (raised an exception that wasn't a \
+  user-error like "value out of range") and you had to retry, give \
+  up on it, or work around it.
+* A tool's description was misleading enough that you tried it the \
+  way the description suggested, it didn't work, and you had to \
+  reverse-engineer the correct call shape.
+* You completed the user's request but had to compromise on \
+  faithfulness because a tool didn't support a needed code path \
+  (e.g. routing to a non-primary InputPort/OutputPort, addressing a \
+  field by name, etc.). Your faithfulness note is exactly the \
+  context the next regen needs.
+
+When you file, describe **the failure, not the workaround**:
+
+* `description`: what you tried (the exact arg shape), what error \
+  came back (verbatim if you have it), and which tool behavior or \
+  description was wrong. Be concrete about call shape and observed \
+  result.
+* `suggested_fix` (optional): a fix to THIS tool — clearer wording, \
+  a missing parameter, an explicit constraint to document. \
+  **Do NOT recommend a different tool by name as the fix.** Each \
+  tool's description must stand alone; the regen LLM that consumes \
+  your report will write a description that mentions the broken \
+  path and its constraint, not one that points at another tool. \
+  Choosing between tools is the agent's job in a future session, \
+  not the description-writer's job.
+* `agent_context` (optional): one sentence on what you were trying \
+  to accomplish for the user.
+
+Don't file for ordinary modeling errors (an invalid PNL configuration, \
+a value out of range). Do file for ANY tool-surface bug — the \
+ecosystem can only fix what gets reported, and the user shouldn't \
+have to remember to ask for it. One issue filed today is one \
+workaround you won't have to invent tomorrow.
 """
 
 

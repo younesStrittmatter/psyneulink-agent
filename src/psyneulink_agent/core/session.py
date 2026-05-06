@@ -86,6 +86,10 @@ from .system_prompt import render_system_prompt
 
 DEFAULT_MODEL = os.environ.get("PSYNEULINK_AGENT_MODEL", "claude-sonnet-4-5-20250929")
 
+# Sentinel for "no per-turn model override was applied" so we can tell that
+# apart from "the override happened to be None" in the swap-and-restore path.
+_UNSET: Any = object()
+
 # Stderr substring psyneulink-mcp prints once it's listening on SSE.
 # Substring match (rather than full-line) keeps us forward-compatible
 # with version-stamp prefixes the MCP may add later.
@@ -295,6 +299,30 @@ class Session:
         ev.set()
         return True
 
+    def reset_history(self, *, clear_resources: bool = False) -> None:
+        """Flush the conversation history to reclaim context window space.
+
+        For the CLI backend this also generates a fresh ``session_id``
+        so the next ``send_user_message`` starts a brand-new ``claude``
+        on-disk session instead of resuming the old one (which would
+        still carry the full history). For the SDK backend, clearing
+        the in-memory list is sufficient.
+
+        After this call ``send_user_message`` behaves as if it were the
+        first turn: any still-attached resources will be included in
+        the first message again. Pass ``clear_resources=True`` to also
+        detach all resources (e.g. a large PDF that caused the context
+        overflow in the first place).
+        """
+        self.history.clear()
+        if clear_resources:
+            self.resources.clear()
+        backend = self.llm_backend
+        if backend.kind == "cli":
+            import uuid as _uuid
+            backend.session_id = str(_uuid.uuid4())  # type: ignore[attr-defined]
+            backend._session_created = False  # type: ignore[attr-defined]
+
     @asynccontextmanager
     async def lifespan(self) -> AsyncIterator[Session]:
         """Open a long-lived MCP connection for the duration of this session.
@@ -403,6 +431,7 @@ class Session:
         text: str,
         *,
         anthropic_client: Any | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Send ``text`` (plus pending resource attachments on first turn)
         and yield events from the model + tool calls.
@@ -417,6 +446,12 @@ class Session:
           mutated. This keeps tests that pre-date the backend split
           working without modification (they pass a fake client and
           expect SDK behaviour).
+
+        ``model`` is a per-turn override. When set, the active backend's
+        ``model`` attribute is temporarily swapped for the duration of
+        this call so the orchestrator can forward its own model choice
+        (e.g. opus 4.7 with 1M context) to the child without permanently
+        mutating the child's session.
 
         If a :meth:`lifespan` is currently active, the long-lived MCP
         session is reused so MCP-side state (handle registry, journal,
@@ -435,6 +470,14 @@ class Session:
                 backend = AnthropicSdkBackend(
                     model=self.model, anthropic_client=anthropic_client
                 )
+
+        # Per-turn model override: swap backend.model for one call.
+        saved_model: Any = _UNSET
+        if model is not None:
+            current = getattr(backend, "model", None)
+            if current != model:
+                saved_model = current
+                backend.model = model  # type: ignore[attr-defined]
 
         is_first_turn = len(self.history) == 0
         content_blocks: list[dict[str, Any]] = []
@@ -480,6 +523,8 @@ class Session:
                     yield event
         finally:
             self._cancel_event = None
+            if saved_model is not _UNSET:
+                backend.model = saved_model  # type: ignore[attr-defined]
 
     def snapshot(self) -> dict[str, Any]:
         """JSON-serialisable summary of the session.
